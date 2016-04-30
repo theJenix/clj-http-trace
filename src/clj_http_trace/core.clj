@@ -1,100 +1,113 @@
 (ns clj-http-trace.core
   (:require [clojure.string :as c]
             [clj-http.client :as http]
-            [robert.hooke :refer :all]))
-
-(defn <->
-  "Calls a function with arguments in reverse order.  If no arguments are supplied, returns a function that will call the original function with the arguments in reversed order.  This is useful for when you want to thread a value through a function using -> or ->> and the function isn't written to take the threaded argument as the first or last argument (respectively)."
-  ([f]
-    (fn[& args]
-      (apply <-> f args)))
-  ([f & args]
-    (->> (reverse args)
-         (apply f))))
+            [clojure.java.io :as io]
+            [robert.hooke :refer :all]
+            [clj-http-trace.utils :refer :all]))
 
 
-; Current EOF, current trace, traces
-(def parser-init [nil {} []])
+; Byte buffer, current EOF, current trace, traces
+(def parser-init [[] nil {} []])
 
-(defn conv [v i]
-  (conj (if (vector? v) v (if v (vec v) [])) i))
+(defn try-consume-line [[buf c t ts] b]
+  (if (= b (byte \newline))
+    (let [line (String. (byte-array buf))]
+      [line [[] c t ts]])
+   [nil [(conv buf b) c t ts]]))
 
-(defn parse-key-value [[curr-fn trace traces] line & ks]
+(defn parse-key-value [[buf curr-fn trace traces] line & ks]
   (let [[kstr v] (c/split line #":" 2)
         k (keyword kstr)
         newtrace (-> trace
                      (assoc-in  (conv ks k) (c/trim v))
-                     (update-in (conv ks "FieldOrder") conv k))]
+                     (update-in (conv ks :FieldOrder) conv k))]
 ;    (println line ks k v)
-    [curr-fn newtrace traces]))
+    [buf curr-fn newtrace traces]))
 
 (defn parse-method
   "Parses the Method: element, which starts every trace"
-  [[_ trace traces] line]
-  (parse-key-value [nil {} (if trace (conj traces trace) traces)] line))
+  [[buf _ trace traces] line]
+  (parse-key-value [buf nil {} (if trace (conj traces trace) traces)] line))
 
 (defn make-header-parse-fn [end k]
-  (fn [s l]
-    (let [[c t ts] s]
-      (if (= l end)
-        [nil t ts]
-        (if-not (.contains l ":")
-          [c (assoc-in t [k :First-Line] l) ts]
-          (parse-key-value s l k))))))
+  (fn [s b]
+    (let [[l nst] (try-consume-line s b)]
+      (if (c/blank? l)
+        nst
+        (let [[buf c t ts] nst]
+          (if (= l end)
+            [buf nil t ts]
+            (if-not (.contains l ":")
+              (assoc-in s [2 k :First-Line] l)
+              (parse-key-value nst l k))))))))
 
 (defn make-body-parse-fn [end k]
-  (fn [s l]
-    (let [[c t ts] s]
-      (if (= l end)
-        (if (= k :Response-Body)
-          [nil nil (conv ts t)]
-          [nil t ts])
-        (update-in s [1 k] conv l)))))
+  (let [endbytes (-> (.getBytes end) ;; TODO: assumes end is a string...probably want to make this more generic
+                     vec)
+        endm     (atom (init-matcher endbytes))] ; TODO: this Atom makes this non-pure...would prefer to push this into the state, but its ok for now
+    (fn [s b]
+      (let [[buf c t ts] s]
+        (if (matches? b @endm) 
+          (do
+            (swap! endm shift-one)
+            (if (all-matched? @endm)
+              [buf nil nil (conv ts t)]
+              s))
+          (let [toappend (conv (get-matched @endm) b)]
+            (swap! endm reset-matcher)
+            (update-in s [2 k] concatv toappend)))))))
 
-(defn parse-request-header [[_ trace traces] line]
+(defn parse-request-header [state line]
   (println "In parse-request-header")
   (let [[k v] (c/split line #":<<" 2)
         new-fn (make-header-parse-fn v :Request-Header)]
-    [new-fn trace traces]))
+    (assoc state 1 new-fn)))
   
-(defn parse-response-header [[_ trace traces] line]
+(defn parse-response-header [state line]
   (println "In parse-response-header")
   (let [[k v] (c/split line #":<<" 2)
         new-fn (make-header-parse-fn v :Response-Header)]
-    [new-fn trace traces]))
+    (assoc state 1 new-fn)))
 
-(defn parse-response-body [[_ trace traces] line]
+(defn parse-response-body [state line]
   (println "In parse-response-body")
   (let [[k v] (c/split line #":<<" 2)
         new-fn (make-body-parse-fn v :Response-Body)]
-    [new-fn trace traces]))
+    (assoc state 1 new-fn)))
 
-(defn def-parse-fn [state line]
-  (condp (<-> c/starts-with?) line
-    "Method:"          (parse-method state line)
-    "Request-Header:"  (parse-request-header state line)
-    "Response-Header:" (parse-response-header state line)
-    "Response-Body:"   (parse-response-body state line)
-    (parse-key-value state line)))
+(defn def-parse-fn [state b]
+  (let [[line newstate] (try-consume-line state b)]
+    (if (c/blank? line)
+      newstate
+      (condp (<-> c/starts-with?) line
+        "Method:"          (parse-method newstate line)
+        "Request-Header:"  (parse-request-header newstate line)
+        "Response-Header:" (parse-response-header newstate line)
+        "Response-Body:"   (parse-response-body newstate line)
+        (parse-key-value newstate line)))))
 
-(defn parse-line [state line]
-  (if (c/blank? line)
-    state
-    (let [[curr-fn trace traces] state]
-      (if curr-fn
-        (curr-fn state line)
-        (def-parse-fn state line)))))
+(defn consume-new-byte
+  [state b]
+  (if-let [curr-fn (second state)]
+    (curr-fn state b)
+    (def-parse-fn state b)))
+
+(defn read-byte-or-default
+  [term in]
+  (let [b (.read in)
+        finished (neg? b)]
+    [b finished]))
 
 (defn parse-trace-file
-  "Parses a trace file and returns a vector of request/response maps"
   [filename]
-  (let [f (.getFile (clojure.java.io/resource filename))
-        txt (-> (slurp f)
-                (c/split #"\r?\n"))
-        _ (println (last txt))
-        traces (reduce parse-line parser-init txt)]
-    (last traces)))
-
+  (let [f (.getFile (io/resource filename))]
+    (with-open [in (io/input-stream f)]
+      (loop [state parser-init]
+        (let [[b finished] (read-byte-or-default (byte \newline) in)
+              newstate (consume-new-byte state b)]
+          (if finished
+            (last newstate)
+            (recur newstate)))))))
 
 (defn utf8-bytes
     "Returns the UTF-8 bytes corresponding to the given string."
@@ -128,8 +141,10 @@
         (let [[httpver statuscode statustxt] (c/split (:First-Line (:Response-Header match)) #" ")]
           (println statuscode)
           {:status (Integer/parseInt statuscode)
-           :headers (assoc (:Response-Header match) "content-encoding" "gzip")
-           :body (body-bytes (c/join "" (apply concat (:Response-Body match))))})
+           :headers (->> (:Response-Header match) 
+                         (map-keys (comp c/lower-case name)))
+           :body (body-bytes (-> (:Response-Body match)
+                                 byte-array))})
 
         {:status 404 :headers {} :body nil}))
     ))
