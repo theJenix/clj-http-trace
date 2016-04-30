@@ -133,8 +133,11 @@
   (fn [origfn {:keys [server-name query-string uri] :as request}]
     (println request)
     (println (str uri "?" query-string))
-    (let [matches (->> traces
-                       (filter (comp #{"GET"} :Method))
+    (let [method (-> (:request-method request)
+                     name
+                     c/upper-case)
+          matches (->> traces
+                       (filter (comp #{method} :Method))
                        (filter (comp #{server-name} :Host))
                        (filter (comp #{(str uri "?" query-string)} :File)))]
       (if-let [match (first matches)]
