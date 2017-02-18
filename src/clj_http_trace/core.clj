@@ -14,7 +14,10 @@
       (parse-stream in))))
 
 (defn make-intercept-fn [traces]
-  (println traces)
   (fn [_ request] 
     (intercept traces request)))
 
+(defn install-trace-intercept! [filename]
+    (->> (parse-trace-file filename) 
+         make-intercept-fn
+         (hooke/add-hook #'clj-http.core/request)))

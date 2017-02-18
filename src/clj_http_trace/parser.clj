@@ -1,5 +1,6 @@
 (ns clj-http-trace.parser
   (:require [clojure.string :as c]
+            [clojure.tools.logging :as log]
             [clj-http-trace.utils :refer :all]))
 
 ; Byte buffer, current EOF, current trace, traces
@@ -17,13 +18,14 @@
         newtrace (-> trace
                      (assoc-in  (conv ks k) (c/trim v))
                      (update-in (conv ks :FieldOrder) conv k))]
-;    (println line ks k v)
     [buf curr-fn newtrace traces]))
 
 (defn parse-method
   "Parses the Method: element, which starts every trace"
   [[buf _ trace traces] line]
-  (parse-key-value [buf nil {} (if trace (conj traces trace) traces)] line))
+  (log/info "In parse-method")
+  (log/debug trace)
+  (parse-key-value [buf nil {} (if trace (conv traces trace) traces)] line))
 
 (defn make-header-parse-fn [end k]
   (fn [s b]
@@ -47,26 +49,32 @@
           (do
             (swap! endm shift-one)
             (if (all-matched? @endm)
-              [buf nil nil (conv ts t)]
+              [buf nil t ts]
               s))
           (let [toappend (conv (get-matched @endm) b)]
             (swap! endm reset-matcher)
             (update-in s [2 k] concatv toappend)))))))
 
 (defn parse-request-header [state line]
-  (println "In parse-request-header")
+  (log/info "In parse-request-header")
   (let [[k v] (c/split line #":<<" 2)
         new-fn (make-header-parse-fn v :Request-Header)]
     (assoc state 1 new-fn)))
+
+(defn parse-request-body [state line]
+  (log/info "In parse-request-body")
+  (let [[k v] (c/split line #":<<" 2)
+        new-fn (make-body-parse-fn v :Request-Body)]
+    (assoc state 1 new-fn)))
   
 (defn parse-response-header [state line]
-  (println "In parse-response-header")
+  (log/info "In parse-response-header")
   (let [[k v] (c/split line #":<<" 2)
         new-fn (make-header-parse-fn v :Response-Header)]
     (assoc state 1 new-fn)))
 
 (defn parse-response-body [state line]
-  (println "In parse-response-body")
+  (log/info "In parse-response-body")
   (let [[k v] (c/split line #":<<" 2)
         new-fn (make-body-parse-fn v :Response-Body)]
     (assoc state 1 new-fn)))
@@ -78,6 +86,7 @@
       (condp (<-> c/starts-with?) line
         "Method:"          (parse-method newstate line)
         "Request-Header:"  (parse-request-header newstate line)
+        "Request-Body:"    (parse-request-body newstate line)
         "Response-Header:" (parse-response-header newstate line)
         "Response-Body:"   (parse-response-body newstate line)
         (parse-key-value newstate line)))))
@@ -100,5 +109,6 @@
     (let [[b finished] (read-byte-or-default (byte \newline) in)
           newstate (consume-new-byte state b)]
       (if finished
-        (last newstate)
+        (let [[_ _ t ts] newstate]
+          (conv ts t))
         (recur newstate)))))
