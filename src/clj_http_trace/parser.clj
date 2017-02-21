@@ -23,7 +23,7 @@
 (defn parse-method
   "Parses the Method: element, which starts every trace"
   [[buf _ trace traces] line]
-  (log/info "In parse-method")
+  (log/debug "In parse-method")
   (log/debug trace)
   (parse-key-value [buf nil {} (if trace (conv traces trace) traces)] line))
 
@@ -56,25 +56,25 @@
             (update-in s [2 k] concatv toappend)))))))
 
 (defn parse-request-header [state line]
-  (log/info "In parse-request-header")
+  (log/debug "In parse-request-header")
   (let [[k v] (c/split line #":<<" 2)
         new-fn (make-header-parse-fn v :Request-Header)]
     (assoc state 1 new-fn)))
 
 (defn parse-request-body [state line]
-  (log/info "In parse-request-body")
+  (log/debug "In parse-request-body")
   (let [[k v] (c/split line #":<<" 2)
         new-fn (make-body-parse-fn v :Request-Body)]
     (assoc state 1 new-fn)))
   
 (defn parse-response-header [state line]
-  (log/info "In parse-response-header")
+  (log/debug "In parse-response-header")
   (let [[k v] (c/split line #":<<" 2)
         new-fn (make-header-parse-fn v :Response-Header)]
     (assoc state 1 new-fn)))
 
 (defn parse-response-body [state line]
-  (log/info "In parse-response-body")
+  (log/debug "In parse-response-body")
   (let [[k v] (c/split line #":<<" 2)
         new-fn (make-body-parse-fn v :Response-Body)]
     (assoc state 1 new-fn)))
